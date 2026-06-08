@@ -1,0 +1,12 @@
+{
+    "display_name": "消息回复小提示",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "RaphllA",
+    "version": "1.0",
+    "homePage": "https://github.com/liminale1525/tip.git",
+    "description": "★"
+}
