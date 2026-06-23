@@ -10,8 +10,10 @@ const defaultSettings = {
     soundEnabled: true,      // 音效开关
     flashTabEnabled: true,   // 标签页闪烁开关
     volume: 0.5,
-    successSound: 'voice.mp3',  // 成功提示音文件名
-    errorSound: 'error_normal.mp3'  // 错误提示音文件名
+    successSound: '清脆风铃声.mp3',  // 成功提示音文件名
+    errorSound: '清脆回响水滴声.mp3',  // 错误提示音文件名
+    // 自定义音频改为存储在设置中（base64 dataURL），以便跨设备同步
+    customAudios: { success: [], error: [] }
 };
 
 // 设置 Favicon 的辅助函数
@@ -86,21 +88,29 @@ let errorSound = null;    // 错误提示音
 let successAudioFiles = [];
 let errorAudioFiles = [];
 
-// 自定义音频（仅 IndexedDB，本地上传）
+// 自定义音频（存储在 extension_settings 中，base64 dataURL，跨设备同步）
+// 旧版本使用 IndexedDB，仅用于一次性迁移到设置中
 const IDB_DB_NAME = 'tip';
 const IDB_STORE = 'audios';
 
 /**
- * customAudios: 内存清单，页面加载时从 IDB 载入
+ * 自定义音频清单存储在 extension_settings[extensionName].customAudios
  * 项结构：
- * { id, kind: 'success'|'error', type: 'idb', name, mime?, size?, createdAt, data?(Blob) }
+ * { id, kind: 'success'|'error', name, mime, size, createdAt, dataUrl }
+ * settings.successSound / errorSound 用 "idb:<id>" 引用（保留前缀以兼容旧设置）
  */
-let customAudios = { success: [], error: [] };
 let idbDb = null;
 
-// 对象URL引用，便于在更换音源时释放
-let successObjectURL = null;
-let errorObjectURL = null;
+// 读取设置中的自定义清单（带容错）
+function getCustomAudios() {
+    const settings = extension_settings[extensionName];
+    if (!settings.customAudios || typeof settings.customAudios !== 'object') {
+        settings.customAudios = { success: [], error: [] };
+    }
+    if (!Array.isArray(settings.customAudios.success)) settings.customAudios.success = [];
+    if (!Array.isArray(settings.customAudios.error)) settings.customAudios.error = [];
+    return settings.customAudios;
+}
 
 // 跟踪生成状态
 let generationState = {
@@ -129,13 +139,14 @@ jQuery(async () => {
    if (settings.flashTabEnabled === undefined) {
        settings.flashTabEnabled = defaultSettings.flashTabEnabled;
    }
+   // 确保自定义音频结构存在
+   getCustomAudios();
 
-   // 初始化并读取自定义音频清单（IndexedDB）
+   // 读取自定义音频清单（设置中），并迁移旧的 IndexedDB 数据（如有）
    try {
-       await initIDB();
        await loadCustomAudios();
    } catch (e) {
-       console.warn(`[${extensionName}] IndexedDB 初始化或读取失败:`, e);
+       console.warn(`[${extensionName}] 自定义音频读取/迁移失败:`, e);
    }
 
    // 扫描内置音频文件（可选）
@@ -155,7 +166,26 @@ jQuery(async () => {
 
 // 扫描音频文件夹中的所有音频文件
 async function scanAudioFiles() {
-    // 获取文件列表
+    // 优先读取 audio/index.json 清单（最可靠，支持任意文件名与 flac/wav/ogg）
+    async function getFilesFromManifest() {
+        try {
+            const url = `/${extensionFolderPath}/audio/index.json`;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 1500);
+            const response = await fetch(url, { signal: controller.signal });
+            clearTimeout(timeoutId);
+            if (!response.ok) return null;
+            const data = await response.json();
+            return {
+                success: Array.isArray(data.success) ? data.success : [],
+                error: Array.isArray(data.error) ? data.error : [],
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // 获取文件列表（回退方案：当没有 index.json 时，探测常见文件名）
     async function getFilesFromFolder(folderType) {
         const testFiles = new Set();
 
@@ -213,15 +243,22 @@ async function scanAudioFiles() {
         return existingFiles;
     }
 
+    // 优先使用清单文件
+    const manifest = await getFilesFromManifest();
+
     // 扫描成功音频文件
-    const newSuccessFiles = await getFilesFromFolder('success');
+    const newSuccessFiles = manifest ? manifest.success : await getFilesFromFolder('success');
     const successChanged = JSON.stringify(successAudioFiles) !== JSON.stringify(newSuccessFiles);
     successAudioFiles = newSuccessFiles;
 
     // 扫描错误音频文件
-    const newErrorFiles = await getFilesFromFolder('error');
+    const newErrorFiles = manifest ? manifest.error : await getFilesFromFolder('error');
     const errorChanged = JSON.stringify(errorAudioFiles) !== JSON.stringify(newErrorFiles);
     errorAudioFiles = newErrorFiles;
+
+    if (manifest) {
+        console.log(`[${extensionName}] 已从 index.json 加载内置音频清单`);
+    }
 
     // 显示扫描结果
     if (successAudioFiles.length === 0) {
@@ -268,96 +305,120 @@ function vt_uuid() {
     return 'id-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
 }
 
-// 从 IDB 读取清单（仅载入 type === 'idb'）
+// 从 IDB 读取清单并迁移到设置中（仅一次性迁移旧数据）
 async function loadCustomAudios() {
-    await initIDB();
-    return new Promise((resolve, reject) => {
-        const tx = idbDb.transaction(IDB_STORE, 'readonly');
+    const custom = getCustomAudios();
+    try {
+        await initIDB();
+    } catch {
+        return; // 没有 IDB 也无妨，设置中已有数据
+    }
+    return new Promise((resolve) => {
+        let tx;
+        try {
+            tx = idbDb.transaction(IDB_STORE, 'readonly');
+        } catch {
+            resolve();
+            return;
+        }
         const store = tx.objectStore(IDB_STORE);
         const req = store.getAll();
-        req.onsuccess = () => {
-            const items = (req.result || []).filter(x => x?.type === 'idb');
-            customAudios.success = items.filter(x => x.kind === 'success');
-            customAudios.error = items.filter(x => x.kind === 'error');
-            resolve(items);
+        req.onsuccess = async () => {
+            const items = (req.result || []).filter(x => x?.type === 'idb' && x.data);
+            if (!items.length) { resolve(); return; }
+
+            // 将旧的 Blob 数据迁移为 dataURL 存入设置
+            let migrated = 0;
+            for (const it of items) {
+                const exists = [...custom.success, ...custom.error].some(x => x.id === it.id);
+                if (exists) continue;
+                try {
+                    const dataUrl = await blobToDataURL(it.data);
+                    const rec = {
+                        id: it.id,
+                        kind: it.kind,
+                        name: it.name || 'audio',
+                        mime: it.mime || it.data.type || 'audio/mpeg',
+                        size: it.size || it.data.size || 0,
+                        createdAt: it.createdAt || 0,
+                        dataUrl,
+                    };
+                    (rec.kind === 'error' ? custom.error : custom.success).push(rec);
+                    migrated++;
+                } catch (e) {
+                    console.warn(`[${extensionName}] 迁移自定义音频失败:`, e);
+                }
+            }
+            if (migrated > 0) {
+                console.log(`[${extensionName}] 已将 ${migrated} 个本地自定义音频迁移到同步设置`);
+                saveSettingsDebounced();
+                // 迁移后清空旧 IDB 数据，避免重复
+                try {
+                    const delTx = idbDb.transaction(IDB_STORE, 'readwrite');
+                    delTx.objectStore(IDB_STORE).clear();
+                } catch {}
+            }
+            resolve();
         };
-        req.onerror = () => reject(req.error);
+        req.onerror = () => resolve();
     });
 }
 
-// 新增本地文件
+// 将 Blob/File 转为 dataURL
+function blobToDataURL(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+    });
+}
+
+// 新增本地文件（转为 dataURL 存入设置，跨设备同步）
 async function addCustomFile(kind, file) {
-    await initIDB();
+    const custom = getCustomAudios();
     const id = vt_uuid();
+    const dataUrl = await blobToDataURL(file);
     const rec = {
         id,
         kind, // 'success' | 'error'
-        type: 'idb',
         name: file.name || 'audio',
         mime: file.type || 'audio/mpeg',
         size: file.size || 0,
         createdAt: Date.now(),
-        data: file, // 直接保存 Blob/File
+        dataUrl,
     };
-    return new Promise((resolve, reject) => {
-        const tx = idbDb.transaction(IDB_STORE, 'readwrite');
-        const store = tx.objectStore(IDB_STORE);
-        const req = store.put(rec);
-        req.onsuccess = async () => {
-            await loadCustomAudios();
-            resolve(rec);
-        };
-        req.onerror = () => reject(req.error);
-    });
+    (kind === 'error' ? custom.error : custom.success).push(rec);
+    saveSettingsDebounced();
+    return rec;
 }
 
 // 删除自定义项
 async function deleteCustomItem(id) {
-    await initIDB();
-    return new Promise((resolve, reject) => {
-        const tx = idbDb.transaction(IDB_STORE, 'readwrite');
-        const store = tx.objectStore(IDB_STORE);
-        const req = store.delete(id);
-        req.onsuccess = async () => {
-            await loadCustomAudios();
-            resolve();
-        };
-        req.onerror = () => reject(req.error);
-    });
+    const custom = getCustomAudios();
+    custom.success = custom.success.filter(x => x.id !== id);
+    custom.error = custom.error.filter(x => x.id !== id);
+    saveSettingsDebounced();
 }
 
 // 查询自定义项
 function getCustomById(kind, id) {
-    return (customAudios[kind] || []).find(x => x.id === id);
+    const custom = getCustomAudios();
+    return (custom[kind] || []).find(x => x.id === id);
 }
 
-// 构建 Audio 实例（支持 内置/IDB）
+// 构建 Audio 实例（支持 内置/自定义 dataURL）
 function buildAudioFor(kind, value) {
     try {
         if (!value) return null;
-
-        // 释放旧的对象URL
-        try {
-            if (kind === 'success' && successObjectURL) {
-                URL.revokeObjectURL(successObjectURL);
-                successObjectURL = null;
-            }
-            if (kind === 'error' && errorObjectURL) {
-                URL.revokeObjectURL(errorObjectURL);
-                errorObjectURL = null;
-            }
-        } catch {}
 
         let src = '';
 
         if (typeof value === 'string' && value.startsWith('idb:')) {
             const id = value.slice(4);
             const rec = getCustomById(kind, id);
-            if (rec && rec.data) {
-                const objUrl = URL.createObjectURL(rec.data);
-                src = objUrl;
-                if (kind === 'success') successObjectURL = objUrl;
-                else errorObjectURL = objUrl;
+            if (rec && rec.dataUrl) {
+                src = rec.dataUrl;
             }
         } else {
             // 内置文件
@@ -671,15 +732,16 @@ function updateSelectOptions() {
         errorSelect.append('<option value="" disabled>请上传，或在 audio/error/ 放置音频文件</option>');
     }
 
-    // 添加自定义（IDB）成功项
-    (customAudios.success || []).forEach(rec => {
+    // 添加自定义成功项
+    const custom = getCustomAudios();
+    (custom.success || []).forEach(rec => {
         const value = `idb:${rec.id}`;
         const label = `[自定义] ${rec.name || ('音频 ' + rec.id.slice(0,6))}`;
         addOption(successSelect, value, label);
     });
 
-    // 添加自定义（IDB）错误项
-    (customAudios.error || []).forEach(rec => {
+    // 添加自定义错误项
+    (custom.error || []).forEach(rec => {
         const value = `idb:${rec.id}`;
         const label = `[自定义] ${rec.name || ('音频 ' + rec.id.slice(0,6))}`;
         addOption(errorSelect, value, label);
@@ -775,7 +837,7 @@ function addSettingsUI() {
 
                     <!-- 提示信息 -->
                     <div style="margin-bottom: 10px; font-size: 12px; color: #888; line-height: 1.4;">
-                        您可以上传本地音频；内置扫描可能受环境限制。支持 mp3/wav/ogg。
+                        内置音频自动加载；也可上传本地音频（≤5MB，跨设备同步）。支持 mp3/wav/ogg/flac。
                     </div>
 
                     <!-- 成功提示音选择 -->
@@ -794,7 +856,7 @@ function addSettingsUI() {
                             <button id="tip-delete-success" class="menu_button" title="删除当前自定义音效" style="display:none;">
                                 <i class="fa-solid fa-trash"></i>
                             </button>
-                            <input id="tip-file-success" type="file" accept="audio/*,.mp3,.wav,.ogg" style="display:none" />
+                            <input id="tip-file-success" type="file" accept="audio/*,.mp3,.wav,.ogg,.flac" style="display:none" />
                         </div>
                     </div>
 
@@ -814,7 +876,7 @@ function addSettingsUI() {
                             <button id="tip-delete-error" class="menu_button" title="删除当前自定义音效" style="display:none;">
                                 <i class="fa-solid fa-trash"></i>
                             </button>
-                            <input id="tip-file-error" type="file" accept="audio/*,.mp3,.wav,.ogg" style="display:none" />
+                            <input id="tip-file-error" type="file" accept="audio/*,.mp3,.wav,.ogg,.flac" style="display:none" />
                         </div>
                     </div>
 
@@ -904,10 +966,11 @@ function bindSettingsControls() {
     // ========== 上传（仅本地文件） ==========
     function validateFile(file) {
         if (!file) return '未选择文件';
-        const okType = file.type?.startsWith('audio/') || /\.(mp3|wav|ogg)$/i.test(file.name || '');
-        if (!okType) return '仅支持音频文件（mp3/wav/ogg）';
-        const max = 10 * 1024 * 1024; // 10MB
-        if (file.size > max) return '文件过大（>10MB）';
+        const okType = file.type?.startsWith('audio/') || /\.(mp3|wav|ogg|flac|m4a|aac)$/i.test(file.name || '');
+        if (!okType) return '仅支持音频文件（mp3/wav/ogg/flac）';
+        // 自定义音频以 base64 存入同步设置，体积过大会拖慢设置保存，限制为 5MB
+        const max = 5 * 1024 * 1024; // 5MB
+        if (file.size > max) return '文件过大（>5MB），自定义音频需跨设备同步，请使用较小的文件';
         return '';
     }
 
